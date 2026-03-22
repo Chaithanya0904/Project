@@ -168,11 +168,7 @@ def inject_current_year():
 
 @app.route('/')
 def index():
-    return "App is running."
-
-@app.route('/health')
-def health():
-    return "OK", 200
+    return render_template('index.html', title="Home")
     
 @app.route('/register', methods=['GET', 'POST'])
 def register():
