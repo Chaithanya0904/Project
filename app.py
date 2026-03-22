@@ -2,7 +2,6 @@
 import os
 import sqlite3
 import uuid
-import pathlib
 import torch
 from datetime import datetime
 import yaml
@@ -19,8 +18,11 @@ app = Flask(__name__)
 app.secret_key = 'wverihdfuvuwi2482'
 
 EMAIL_ADDRESS = "c9074hai@gmail.com"
-EMAIL_PASSWORD = "dnhd qnaf dklq jshy"  
+EMAIL_PASSWORD = "dnhd qnaf dklq jshy"
 ADMIN_EMAIL = "deeplearning251@gmail.com"
+
+# ===================== SOCKETIO =====================
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # ===================== AI AUTO-PROCESS CONFIG =====================
 AUTO_RESOLUTIONS = {
@@ -63,10 +65,8 @@ AUTO_RESOLUTIONS = {
 }
 
 def auto_process_complaint(complaint_id, result_text, title="", description=""):
-    """Automatically updates complaint based on AI detection or text fallback."""
     primary_issue = None
-    
-    # 1. Try matching by detection result
+
     if result_text and result_text != "No object detected":
         detection_list = [d.strip().lower() for d in result_text.split(',')]
         for d in detection_list:
@@ -74,16 +74,14 @@ def auto_process_complaint(complaint_id, result_text, title="", description=""):
                 primary_issue = d
                 break
 
-    # 2. Fallback: Search in title/description if no detection match
     if not primary_issue:
         search_text = f"{title} {description}".lower()
-        # Sort keys by length descending to match longest phrases first (e.g. 'water leakage' before 'water')
         sorted_keys = sorted(AUTO_RESOLUTIONS.keys(), key=len, reverse=True)
         for key in sorted_keys:
             if key in search_text:
                 primary_issue = key
                 break
-                
+
     if primary_issue:
         config = AUTO_RESOLUTIONS[primary_issue]
         conn = get_db_connection()
@@ -93,8 +91,7 @@ def auto_process_complaint(complaint_id, result_text, title="", description=""):
         )
         conn.commit()
         conn.close()
-        
-        # Broadcast the update in real-time
+
         try:
             socketio.emit('complaint_update', {
                 'id': complaint_id,
@@ -188,7 +185,7 @@ def register():
             filename = secure_filename(profile_image.filename)
             image_path = os.path.join(app.config['PROFILE_UPLOAD_FOLDER'], filename)
             profile_image.save(image_path)
-        
+
         hashed_password = generate_password_hash(password)
         conn = get_db_connection()
         try:
@@ -236,7 +233,9 @@ def profile():
     conn.close()
     return render_template('profile.html', user=user)
 
-# YOLO Integration
+# ===================== YOLO Integration =====================
+model = None
+
 def resolve_yolo_weights_path():
     candidates = [
         os.path.join(BASE_DIR, 'yolov5s.pt'),
@@ -247,35 +246,52 @@ def resolve_yolo_weights_path():
             return candidate
     return None
 
-YOLO_WEIGHTS_PATH = resolve_yolo_weights_path()
-if YOLO_WEIGHTS_PATH:
-    model = torch.hub.load('ultralytics/yolov5', 'custom', path=YOLO_WEIGHTS_PATH)
-else:
-    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-model.conf = 0.15
+def get_model():
+    global model
+    if model is None:
+        yolo_weights_path = resolve_yolo_weights_path()
+        if yolo_weights_path:
+            model = torch.hub.load('ultralytics/yolov5', 'custom', path=yolo_weights_path)
+        else:
+            model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+        model.conf = 0.15
+    return model
 
 def run_yolo_detection(image_path, detection_folder, filename):
     import cv2
+
     img = cv2.imread(image_path)
-    if img is None: return None, "Error"
-    results = model(img)
-    detected = list(set([model.names[int(cls)] for *box, conf, cls in results.xyxy[0]]))
+    if img is None:
+        return None, "Error"
+
+    mdl = get_model()
+    results = mdl(img)
+    detected = list(set([mdl.names[int(cls)] for *box, conf, cls in results.xyxy[0]]))
     result_text = ", ".join(detected) if detected else "No object detected"
-    results.render()
-    cv2.imwrite(os.path.join(detection_folder, filename), img)
+
+    rendered = results.render()[0]
+    cv2.imwrite(os.path.join(detection_folder, filename), rendered)
+
     return f"detections/{filename}", result_text
 
 @app.route('/complaint', methods=['GET', 'POST'])
 def complaint():
-    if 'email' not in session: return redirect(url_for('login'))
+    if 'email' not in session:
+        return redirect(url_for('login'))
+
     if request.method == 'POST':
-        title, desc = request.form.get('title'), request.form.get('description')
+        title = request.form.get('title')
+        desc = request.form.get('description')
         img_file = request.files.get('complaint_image')
+
         if not title or not desc or not img_file:
-            flash('Missing fields', 'danger'); return redirect(request.url)
+            flash('Missing fields', 'danger')
+            return redirect(request.url)
+
         if not img_file.filename or not allowed_file(img_file.filename, 'image'):
-            flash('Please upload a valid image file.', 'danger'); return redirect(request.url)
-        
+            flash('Please upload a valid image file.', 'danger')
+            return redirect(request.url)
+
         ext = secure_filename(img_file.filename).rsplit('.', 1)[1].lower()
         unique_name = f"{uuid.uuid4().hex}.{ext}"
         upload_path = os.path.join(app.config['COMPLAINT_UPLOAD_FOLDER'], unique_name)
@@ -285,8 +301,10 @@ def complaint():
         det_path, res_text = run_yolo_detection(upload_path, det_folder, unique_name)
 
         conn = get_db_connection()
-        cursor = conn.execute("INSERT INTO complients (title, description, image_path, result, user_email) VALUES (?, ?, ?, ?, ?)",
-                     (title, desc, det_path, res_text, session['email']))
+        cursor = conn.execute(
+            "INSERT INTO complients (title, description, image_path, result, user_email) VALUES (?, ?, ?, ?, ?)",
+            (title, desc, det_path, res_text, session['email'])
+        )
         conn.commit()
         complaint_id = cursor.lastrowid
         conn.close()
@@ -294,11 +312,13 @@ def complaint():
         auto_process_complaint(complaint_id, res_text, title, desc)
         flash('Complaint filed successfully.', 'success')
         return redirect(url_for('my_complaints'))
+
     return render_template('complaint.html', title="File Complaint")
 
 @app.route('/my_complaints')
 def my_complaints():
-    if 'email' not in session: return redirect(url_for('login'))
+    if 'email' not in session:
+        return redirect(url_for('login'))
     conn = get_db_connection()
     complaints = conn.execute("SELECT * FROM complients WHERE user_email = ?", (session['email'],)).fetchall()
     conn.close()
@@ -306,7 +326,8 @@ def my_complaints():
 
 @app.route('/admin_dashboard')
 def admin_dashboard():
-    if session.get('role') != 'admin': return redirect(url_for('login'))
+    if session.get('role') != 'admin':
+        return redirect(url_for('login'))
     conn = get_db_connection()
     u_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     c_count = conn.execute("SELECT COUNT(*) FROM complients").fetchone()[0]
@@ -315,7 +336,8 @@ def admin_dashboard():
 
 @app.route('/admin/complaints')
 def admin_complaints():
-    if session.get('role') != 'admin': return redirect(url_for('login'))
+    if session.get('role') != 'admin':
+        return redirect(url_for('login'))
     conn = get_db_connection()
     complaints = conn.execute("SELECT * FROM complients").fetchall()
     conn.close()
@@ -323,7 +345,8 @@ def admin_complaints():
 
 @app.route('/admin/users')
 def admin_users():
-    if session.get('role') != 'admin': return redirect(url_for('login'))
+    if session.get('role') != 'admin':
+        return redirect(url_for('login'))
     conn = get_db_connection()
     users = conn.execute("SELECT * FROM users").fetchall()
     conn.close()
@@ -331,31 +354,41 @@ def admin_users():
 
 @app.route('/admin/delete-user/<int:user_id>', methods=['POST'])
 def delete_user(user_id):
-    if session.get('role') != 'admin': return redirect(url_for('login'))
+    if session.get('role') != 'admin':
+        return redirect(url_for('login'))
     conn = get_db_connection()
     user = conn.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
     if not user or user['role'] == 'admin':
-        conn.close(); return redirect(url_for('admin_users'))
+        conn.close()
+        return redirect(url_for('admin_users'))
     conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     return redirect(url_for('admin_users'))
 
 @app.route('/admin/complaint/delete/<int:complaint_id>', methods=['POST'])
 def delete_complaint(complaint_id):
-    if session.get('role') != 'admin': return redirect(url_for('login'))
+    if session.get('role') != 'admin':
+        return redirect(url_for('login'))
     conn = get_db_connection()
     conn.execute("DELETE FROM complients WHERE id = ?", (complaint_id,))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     return redirect(url_for('admin_complaints'))
 
 @app.route('/admin/complaint/edit/<int:complaint_id>', methods=['GET', 'POST'])
 def admin_complaint_edit(complaint_id):
-    if session.get('role') != 'admin': return redirect(url_for('login'))
+    if session.get('role') != 'admin':
+        return redirect(url_for('login'))
     conn = get_db_connection()
     complaint = conn.execute("SELECT * FROM complients WHERE id = ?", (complaint_id,)).fetchone()
     if request.method == 'POST':
-        conn.execute("UPDATE complients SET result = ?, status = ? WHERE id = ?", (request.form['result'], request.form['status'], complaint_id))
-        conn.commit(); conn.close()
+        conn.execute(
+            "UPDATE complients SET result = ?, status = ? WHERE id = ?",
+            (request.form['result'], request.form['status'], complaint_id)
+        )
+        conn.commit()
+        conn.close()
         return redirect(url_for('admin_complaints'))
     conn.close()
     return render_template('admin_complaint_edit.html', complaint=complaint, auto_resolutions=AUTO_RESOLUTIONS)
@@ -364,58 +397,66 @@ def admin_complaint_edit(complaint_id):
 def admin_auto_process(complaint_id):
     if session.get('role') != 'admin':
         return redirect(url_for('login'))
-    
+
     conn = get_db_connection()
     complaint = conn.execute("SELECT * FROM complients WHERE id = ?", (complaint_id,)).fetchone()
     conn.close()
-    
+
     if complaint:
         success = auto_process_complaint(
-            complaint_id, 
-            complaint['result'], 
-            complaint['title'], 
+            complaint_id,
+            complaint['result'],
+            complaint['title'],
             complaint['description']
         )
         if success:
             flash(f"AI successfully processed complaint #{complaint_id}", "success")
         else:
             flash("AI could not determine a resolution for this complaint. Please handle manually.", "warning")
-            
+
     return redirect(url_for('admin_complaints'))
 
 @app.template_filter('time_ago')
 def time_ago(value):
-    if not value: return ''
+    if not value:
+        return ''
     if isinstance(value, str):
-        try: value = datetime.fromisoformat(value)
-        except: return value
+        try:
+            value = datetime.fromisoformat(value)
+        except Exception:
+            return value
     diff = datetime.now() - value
     sec = diff.total_seconds()
-    if sec < 60: return "just now"
-    if sec < 3600: return f"{int(sec//60)}m ago"
-    if sec < 86400: return f"{int(sec//3600)}h ago"
+    if sec < 60:
+        return "just now"
+    if sec < 3600:
+        return f"{int(sec // 60)}m ago"
+    if sec < 86400:
+        return f"{int(sec // 3600)}h ago"
     return value.strftime("%b %d")
-
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 @app.route('/chat')
 def user_chat():
-    if 'email' not in session: return redirect(url_for('login'))
+    if 'email' not in session:
+        return redirect(url_for('login'))
     return render_template('user_chat.html', room_id=session['email'], user_name=session['name'])
 
 @app.route('/admin/chat/<user_email>')
 def admin_chat(user_email):
-    if session.get('role') != 'admin': return redirect(url_for('login'))
+    if session.get('role') != 'admin':
+        return redirect(url_for('login'))
     return render_template('admin_chat.html', room_id=user_email, user_name=session['name'])
 
 @app.route('/admin/online-users')
 def admin_online_users():
-    if session.get('role') != 'admin': return redirect(url_for('login'))
+    if session.get('role') != 'admin':
+        return redirect(url_for('login'))
     return render_template('online_users.html')
 
 @app.route('/admin/chat-list')
 def admin_chat_list():
-    if session.get('role') != 'admin': return redirect(url_for('login'))
+    if session.get('role') != 'admin':
+        return redirect(url_for('login'))
     conn = get_db_connection()
     users = conn.execute("SELECT name, email FROM users WHERE role != 'admin'").fetchall()
     conn.close()
@@ -423,19 +464,31 @@ def admin_chat_list():
 
 @socketio.on('join')
 def on_join(data):
-    room, user = data['room'], data['user']
+    room = data['room']
+    user = data['user']
     join_room(room)
     emit('status', {'msg': f"{user} joined"}, room=room)
 
 @socketio.on('send_message')
 def handle_message(data):
-    room, sender, msg = data['room'], data['user'], data['message']
+    room = data['room']
+    sender = data['user']
+    msg = data['message']
     emit('receive_message', {'user': sender, 'msg': msg}, room=room)
 
 @app.route('/logout')
 def logout():
-    session.clear(); return redirect(url_for('login'))
+    session.clear()
+    return redirect(url_for('login'))
+
+init_db()
 
 if __name__ == '__main__':
-    init_db()
-    socketio.run(app, host="0.0.0.0", port=5000, debug=True, use_reloader=False, allow_unsafe_werkzeug=True)
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        debug=False,
+        use_reloader=False,
+        allow_unsafe_werkzeug=True
+    )
